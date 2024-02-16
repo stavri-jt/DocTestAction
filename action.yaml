@@ -1,0 +1,90 @@
+
+name: 'Run Test container image with Snyk'
+description: 'Setup Docker build and push GitHub Actions'
+inputs:
+  image:
+    description: 'Image to test'
+    type: string
+    required: true
+  snyk-token:
+    description: 'Snyk Auth token'
+    type: string
+    required: true
+  dockerfile: 
+    description: 'Dockerfile user for getting base image data'
+    required: false
+    type: string
+    default: Dockerfile
+  report-branch:
+    description: 'Branch name to monitor. Results will be uploaded to Snyk after push to this branch'
+    required: false
+    type: string
+    default: master
+  ignore-errors:
+    description: 'Will finish with success even if Snyk return an error. Could be used in case of emergencies to avoid blocking the pipelines.'
+    required: false
+    type: boolean
+    default: false
+runs:
+  using: 'composite'
+  steps:
+    - uses: snyk/actions/setup@master
+    - name: Upload Docker image vulnerability scan results
+      shell: bash
+      if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', inputs.report-branch)
+      run: snyk container monitor  --file=${{ inputs.dockerfile }} ${{ inputs.image }}
+      env:
+        SNYK_TOKEN: ${{ inputs.snyk-token }}
+      continue-on-error: ${{ inputs.ignore-errors && true || false}}
+
+    - name: Docker check for vulnerabilities (snyk)
+      id: docker_snyk_scan
+      if: github.event_name == 'pull_request'
+      shell: bash
+      run: |
+        set +e
+        snyk container test --file=${{ inputs.dockerfile }} ${{ inputs.image }} --json-file-output=snyk_results.json
+        echo "exitcode=$?" >> $GITHUB_OUTPUT
+      env:
+        SNYK_TOKEN: ${{ inputs.snyk-token }}
+      continue-on-error: true
+
+    - name: Check if Snyk succeeded
+      if: github.event_name == 'pull_request' && !inputs.ignore-errors && steps.docker_snyk_scan.outputs.exitcode != 0 && steps.docker_snyk_scan.outputs.exitcode != 1
+      shell: bash
+      run: echo "Snyk scan failed. Please check the previous stage for details" && exit 1
+
+    - name: Process Snyk results
+      id: snyk_filter_new_issues
+      if: github.event_name == 'pull_request'
+      shell: bash
+      run: |
+        set +e
+        echo '**Snyk Container Scan Results**' > new_vulns_summary.txt
+        echo '```diff' > new_vulns_summary.txt
+        cat snyk_results.json | snyk-delta >> new_vulns_summary.txt 
+        echo "exitcode=$?" >> $GITHUB_OUTPUT
+        sed -i -e '/Low/,/^$/ s/^/# /' -e '/Low/,/^$/ !{
+        /High/s/^/- /
+        /Critical/s/^/- /
+        /Fixed/s/^/+ /
+        /Fixable/s/^/+ /
+        /Via/s/^/! /
+        }' new_vulns_summary.txt
+        echo '```' >> new_vulns_summary.txt
+        cat new_vulns_summary.txt
+      env:
+        SNYK_TOKEN: ${{ inputs.snyk-token }}
+      continue-on-error: true
+
+    - name: Check if snyk-delta succeeded
+      if: github.event_name == 'pull_request' && !inputs.ignore-errors && steps.snyk_filter_new_issues.outputs.exitcode != 0 && steps.snyk_filter_new_issues.outputs.exitcode != 1
+      shell: bash
+      run: echo "Snyk-delta failed to filter results. Please check the previous stage for details" && exit 1
+
+    - name: Add PR comment with results
+      if: github.event_name == 'pull_request' && (steps.snyk_filter_new_issues.outputs.exitcode == 0 || steps.snyk_filter_new_issues.outputs.exitcode == 1)
+      uses: thollander/actions-comment-pull-request@9d67388b9a94966eb262e68d9a3b368497990b77
+      with:
+        filePath: new_vulns_summary.txt
+        comment_tag: snyk_results
